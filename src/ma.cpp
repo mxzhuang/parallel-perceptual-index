@@ -37,7 +37,8 @@ double std_over_mean(const double* a, size_t n, double eps) {
 // mean of sorted values in [from, to)
 double mean_range(const Vec& s, size_t from, size_t to) { return mc::mean(s.data() + from, to - from); }
 
-void block_dct(const Mat& im, double out[6]) {
+void block_dct(const Mat& im, double out[6], Variant variant) {
+    const bool faithful = variant == Variant::Faithful;
     const int R = im.rows, C = im.cols;
     const int nbr = (R + 2) / 3, nbc = (C + 2) / 3;
     const size_t nb = static_cast<size_t>(nbr) * nbc;
@@ -62,16 +63,21 @@ void block_dct(const Mat& im, double out[6]) {
                     int y = 3 * br - 2 + r, x = 3 * bc - 2 + c;
                     win[c * 7 + r] = (y >= 0 && y < R && x >= 0 && x < C) ? im(y, x) : 0.0;
                 }
-            dct.apply(win, D);  // computed once, shared by all five statistics
+            // baseline: one DCT shared by all five statistics; faithful: one DCT per statistic,
+            // as each of the five blkproc calls of block_dct.m recomputes dct2
+            dct.apply(win, D);
             const size_t k = br + static_cast<size_t>(bc) * nbr;
 
-            gama[k] = ggd.fit(D + 1, 48);  // all coefficients except DC (column-major)
+            // all coefficients except DC (column-major)
+            gama[k] = faithful ? GgdTable::fit_faithful(D + 1, 48) : ggd.fit(D + 1, 48);
+            if (faithful) dct.apply(win, D);
             for (int i = 0; i < 48; ++i) a48[i] = std::fabs(D[i + 1]);
             cv[k] = std_over_mean(a48, 48, 0.0000001);
 
             double g[3];
             const int (*lists[3])[2] = {o1, o2, o3};
             for (int l = 0; l < 3; ++l) {
+                if (faithful) dct.apply(win, D);
                 for (int i = 0; i < 16; ++i) a16[i] = std::fabs(D[lists[l][i][1] * 7 + lists[l][i][0]]);
                 g[l] = std_over_mean(a16, 16, 0.00000001);
             }
@@ -146,8 +152,15 @@ RcosFn rcos_fn() {
 }
 
 void sf_levels(CMat lodft, Mat log_rad, Mat angle, Vec Xrcos, const Vec& Yrcos, int ht, int level,
-               SteerablePyramid& pyr) {
-    if (ht <= 0) return;  // the final low-pass residual is not used by Ma's features
+               SteerablePyramid& pyr, bool faithful) {
+    if (ht <= 0) {
+        // final low-pass residual: not used by Ma's features, computed only in the faithful variant
+        if (faithful) {
+            const CMat lo0 = mc::ifft2(mc::ifftshift(lodft));
+            g_unused_sink = lo0.d[0].real();
+        }
+        return;
+    }
     const int nbands = 6, order = 5;
     for (double& x : Xrcos) x -= 1.0;  // log2(2)
     const int lutsize = 1024;
@@ -172,7 +185,7 @@ void sf_levels(CMat lodft, Mat log_rad, Mat angle, Vec Xrcos, const Vec& Yrcos, 
         for (size_t i = 0; i < band.numel(); ++i) re.d[i] = band.d[i].real();
         pyr.band[level][b] = std::move(re);
     }
-    if (ht - 1 <= 0) return;
+    if (ht - 1 <= 0 && !faithful) return;
 
     const int R = lodft.rows, C = lodft.cols;
     const int ctr[2] = {static_cast<int>(std::ceil((R + 0.5) / 2)), static_cast<int>(std::ceil((C + 0.5) / 2))};
@@ -188,11 +201,11 @@ void sf_levels(CMat lodft, Mat log_rad, Mat angle, Vec Xrcos, const Vec& Yrcos, 
     for (size_t i = 0; i < Yrcos.size(); ++i) YIrcos[i] = std::fabs(std::sqrt(1.0 - Yrcos[i] * Yrcos[i]));
     const Mat lomask = point_op(log_rad, Lut{YIrcos, Xrcos[0], Xrcos[1] - Xrcos[0]});
     for (size_t i = 0; i < lo.numel(); ++i) lo.d[i] = lomask.d[i] * lo.d[i];
-    sf_levels(std::move(lo), std::move(log_rad), std::move(angle), Xrcos, Yrcos, ht - 1, level + 1, pyr);
+    sf_levels(std::move(lo), std::move(log_rad), std::move(angle), Xrcos, Yrcos, ht - 1, level + 1, pyr, faithful);
 }
 }  // namespace
 
-SteerablePyramid build_sf_pyramid(const Mat& im) {
+SteerablePyramid build_sf_pyramid(const Mat& im, Variant variant) {
     const int R = im.rows, C = im.cols;
     const int ht = 2;
     if (ht > static_cast<int>(std::floor(std::log2(std::min(R, C)))) - 2)
@@ -226,7 +239,7 @@ SteerablePyramid build_sf_pyramid(const Mat& im) {
         hi0dft.d[i] = imdft.d[i] * hi0mask.d[i];
     }
     SteerablePyramid pyr;
-    sf_levels(std::move(lo0dft), log_rad, angle, rc.X, Yrcos, ht, 0, pyr);
+    sf_levels(std::move(lo0dft), log_rad, angle, rc.X, Yrcos, ht, 0, pyr, variant == Variant::Faithful);
     CMat hi0 = mc::ifft2(mc::ifftshift(hi0dft));
     pyr.hi0 = Mat(R, C);
     for (size_t i = 0; i < hi0.numel(); ++i) pyr.hi0.d[i] = hi0.d[i].real();
@@ -236,14 +249,34 @@ SteerablePyramid build_sf_pyramid(const Mat& im) {
 namespace {
 // ============================================================================
 // M5: divisive normalisation (norm_sender_normalized.m, Nsc = 2, Nor = 6, 3x3 block,
-//     parent and neighbours on). The unused histogram of the original is omitted.
+//     parent and neighbours on). The histogram of the original is never used; it is computed
+//     only in the faithful variant.
 // ============================================================================
 struct NormalizedBands {
     Vec subband[12];     // vectorised, guard band removed, zero mean
     int size_band[12][2];
 };
 
-NormalizedBands divisive_normalization(const SteerablePyramid& pyr) {
+// [hy, rangeo] = hist(o_c, 50); hy = hy / sum(hy)  (result unused by the official code)
+void unused_histogram(const Vec& x, int nbins) {
+    double lo = x[0], hi = x[0];
+    for (double v : x) {
+        lo = std::min(lo, v);
+        hi = std::max(hi, v);
+    }
+    std::vector<double> hy(nbins, 0.0);
+    const double w = (hi - lo) / nbins;
+    for (double v : x) {
+        int b = w > 0 ? static_cast<int>((v - lo) / w) : 0;
+        hy[std::min(std::max(b, 0), nbins - 1)] += 1;
+    }
+    double total = 0;
+    for (double h : hy) total += h;
+    for (double& h : hy) h /= total;
+    g_unused_sink = hy[0];
+}
+
+NormalizedBands divisive_normalization(const SteerablePyramid& pyr, Variant variant) {
     NormalizedBands out;
     const int Nor = 6, Nband = 13;  // size(pind,1) - 1
     int p = 0;
@@ -315,6 +348,7 @@ NormalizedBands divisive_normalization(const SteerablePyramid& pyr) {
                 for (int r = 0; r < nblv; ++r) o_c[r + static_cast<size_t>(c) * nblv] = aux(r + 1, c + 1);
             const double mu = mc::mean(o_c.data(), nexp);
             for (double& v : o_c) v -= mu;
+            if (variant == Variant::Faithful) unused_histogram(o_c, 50);
             Vec g(nexp);
             std::vector<double> yrow(ncols), yp(ncols);
             for (size_t k = 0; k < nexp; ++k) {
@@ -370,10 +404,13 @@ const SsimWindow& ssim_window() {
 }
 
 // mcs = mean2(cs_map), cs_map = (2 sigma12 + C2) / (sigma1^2 + sigma2^2 + C2)
-double ssim_structure(const Mat& a, const Mat& b, ConvMode conv) {
+// Baseline: separable window, only the structure term. Faithful: direct 11x11 window and the
+// full ssim_map / mssim as well, which the official code computes but Ma does not use.
+double ssim_structure(const Mat& a, const Mat& b, Variant variant) {
+    const bool faithful = variant == Variant::Faithful;
     const SsimWindow& w = ssim_window();
     auto filt = [&](const Mat& x) {
-        return conv == ConvMode::Direct ? mc::filter2_valid(w.w2d, x) : mc::filter2_valid_separable(w.w1d, x);
+        return faithful ? mc::filter2_valid(w.w2d, x) : mc::filter2_valid_separable(w.w1d, x);
     };
     Mat aa(a.rows, a.cols), bb(a.rows, a.cols), ab(a.rows, a.cols);
     for (size_t i = 0; i < a.numel(); ++i) {
@@ -382,15 +419,19 @@ double ssim_structure(const Mat& a, const Mat& b, ConvMode conv) {
         ab.d[i] = a.d[i] * b.d[i];
     }
     const Mat mu1 = filt(a), mu2 = filt(b), s11 = filt(aa), s22 = filt(bb), s12 = filt(ab);
+    const double C1 = (0.01 * 255) * (0.01 * 255);
     const double C2 = (0.03 * 255) * (0.03 * 255);
-    double sum = 0;
+    double sum = 0, ssim_sum = 0;
     for (size_t i = 0; i < mu1.numel(); ++i) {
         double m1 = mu1.d[i], m2 = mu2.d[i];
         double sigma1_sq = s11.d[i] - m1 * m1;
         double sigma2_sq = s22.d[i] - m2 * m2;
         double sigma12 = s12.d[i] - m1 * m2;
         sum += (2 * sigma12 + C2) / (sigma1_sq + sigma2_sq + C2);
+        if (faithful)
+            ssim_sum += ((2 * m1 * m2 + C1) * (2 * sigma12 + C2)) / ((m1 * m1 + m2 * m2 + C1) * (sigma1_sq + sigma2_sq + C2));
     }
+    if (faithful) g_unused_sink = ssim_sum / static_cast<double>(mu1.numel());  // mssim
     return sum / static_cast<double>(mu1.numel());
 }
 
@@ -401,7 +442,7 @@ Mat reshape(const Vec& v, int rows, int cols) {
 }
 }  // namespace
 
-MaFeatures ma_features(const Mat& gray, ConvMode conv, ModuleTimer* timer) {
+MaFeatures ma_features(const Mat& gray, Variant variant, ModuleTimer* timer) {
     MaFeatures f;
     SpatialPyramid sp;
     {
@@ -411,7 +452,7 @@ MaFeatures ma_features(const Mat& gray, ConvMode conv, ModuleTimer* timer) {
     {
         ModuleTimer::Scope t(timer, 2);
         f.f1.resize(18);
-        for (int s = 0; s < 3; ++s) block_dct(sp.im[s], &f.f1[6 * s]);
+        for (int s = 0; s < 3; ++s) block_dct(sp.im[s], &f.f1[6 * s], variant);
     }
     {
         ModuleTimer::Scope t(timer, 3);
@@ -423,32 +464,35 @@ MaFeatures ma_features(const Mat& gray, ConvMode conv, ModuleTimer* timer) {
     SteerablePyramid pyr;
     {
         ModuleTimer::Scope t(timer, 4);
-        pyr = build_sf_pyramid(gray);  // global_gsm works on double(img), 0..255
+        pyr = build_sf_pyramid(gray, variant);  // global_gsm works on double(img), 0..255
     }
     NormalizedBands nb;
     {
         ModuleTimer::Scope t(timer, 5);
-        nb = divisive_normalization(pyr);
+        nb = divisive_normalization(pyr, variant);
     }
     {
         ModuleTimer::Scope t(timer, 6);
         const GgdTable& ggd = ggd_table();
+        auto fit = [&](const Vec& x) {
+            return variant == Variant::Faithful ? GgdTable::fit_faithful(x.data(), x.size()) : ggd.fit(x.data(), x.size());
+        };
         f.f2.reserve(45);
-        for (int i = 0; i < 12; ++i) f.f2.push_back(ggd.fit(nb.subband[i].data(), nb.subband[i].size()));
+        for (int i = 0; i < 12; ++i) f.f2.push_back(fit(nb.subband[i]));
         for (int i = 0; i < 6; ++i) {
             Vec t2 = nb.subband[i];
             t2.insert(t2.end(), nb.subband[i + 6].begin(), nb.subband[i + 6].end());
-            f.f2.push_back(ggd.fit(t2.data(), t2.size()));
+            f.f2.push_back(fit(t2));
         }
         for (int i = 0; i < 12; ++i) {
             const Mat& band = pyr.band[i / 6][i % 6];
             Mat up = mc::imresize_size(band, pyr.hi0.rows, pyr.hi0.cols);
-            f.f2.push_back(ssim_structure(up, pyr.hi0, conv));
+            f.f2.push_back(ssim_structure(up, pyr.hi0, variant));
         }
         for (int i = 0; i < 6; ++i)
             for (int j = i + 1; j < 6; ++j)
                 f.f2.push_back(ssim_structure(reshape(nb.subband[i], nb.size_band[i][0], nb.size_band[i][1]),
-                                              reshape(nb.subband[j], nb.size_band[j][0], nb.size_band[j][1]), conv));
+                                              reshape(nb.subband[j], nb.size_band[j][0], nb.size_band[j][1]), variant));
     }
     return f;
 }

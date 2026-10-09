@@ -16,6 +16,8 @@ public:
     double fit(const double* x, size_t n) const;           // returns the shape parameter
     double fit_rho(double rho) const;                       // lookup only
     double fit_rho_bruteforce(double rho) const;            // reference implementation
+    // As the official gama_gen_gauss: rebuild the table and scan it linearly on every call.
+    static double fit_faithful(const double* x, size_t n);
 private:
     Vec g_, r_;
     bool decreasing_ = true;
@@ -27,8 +29,13 @@ class AggdTable {
 public:
     AggdTable();
     void fit(const double* x, size_t n, double& alpha, double& betal, double& betar) const;
+    // As the official estimateaggdparam: rebuild the table on every call.
+    static void fit_faithful(const double* x, size_t n, double& alpha, double& betal, double& betar);
 
 private:
+    static void build(Vec& gam, Vec& r);
+    static void fit_with(const Vec& gam, const Vec& r, const double* x, size_t n, double& alpha, double& betal,
+                         double& betar);
     Vec gam_, r_;
 };
 

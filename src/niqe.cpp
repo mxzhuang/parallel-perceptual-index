@@ -30,10 +30,15 @@ namespace {
 constexpr int kFeat = 18;
 
 // computefeature.m for one block
-void compute_feature(const Mat& block, double* feat) {
+// Baseline: AGGD table built once. Faithful: rebuilt on every call, as estimateaggdparam.m does.
+void compute_feature(const Mat& block, double* feat, bool faithful) {
     const AggdTable& aggd = aggd_table();
+    auto fit = [&](const double* x, size_t n, double& a, double& l, double& r) {
+        if (faithful) AggdTable::fit_faithful(x, n, a, l, r);
+        else aggd.fit(x, n, a, l, r);
+    };
     double alpha, bl, br;
-    aggd.fit(block.d.data(), block.numel(), alpha, bl, br);
+    fit(block.d.data(), block.numel(), alpha, bl, br);
     feat[0] = alpha;
     feat[1] = (bl + br) / 2;
     static const int shifts[4][2] = {{0, 1}, {1, 0}, {1, 1}, {1, -1}};
@@ -41,7 +46,7 @@ void compute_feature(const Mat& block, double* feat) {
     for (int s = 0; s < 4; ++s) {
         Mat sh = mc::circshift(block, shifts[s][0], shifts[s][1]);
         for (size_t i = 0; i < pair.size(); ++i) pair[i] = block.d[i] * sh.d[i];
-        aggd.fit(pair.data(), pair.size(), alpha, bl, br);
+        fit(pair.data(), pair.size(), alpha, bl, br);
         double meanparam = (br - bl) * (std::tgamma(2 / alpha) / std::tgamma(1 / alpha));
         feat[2 + 4 * s + 0] = alpha;
         feat[2 + 4 * s + 1] = meanparam;
@@ -51,7 +56,8 @@ void compute_feature(const Mat& block, double* feat) {
 }
 }  // namespace
 
-double niqe_score(const Mat& gray, const NiqeModel& model, ModuleTimer* timer) {
+double niqe_score(const Mat& gray, const NiqeModel& model, Variant variant, ModuleTimer* timer) {
+    const bool faithful = variant == Variant::Faithful;
     ModuleTimer::Scope t(timer, 7);
     const int bs = 96;
     const int mb = gray.rows / bs, nbk = gray.cols / bs;
@@ -74,17 +80,27 @@ double niqe_score(const Mat& gray, const NiqeModel& model, ModuleTimer* timer) {
         for (size_t i = 0; i < im.numel(); ++i) sq.d[i] = im.d[i] * im.d[i];
         const Mat mu = mc::imfilter(im, window, mc::Boundary::Replicate);
         const Mat ex2 = mc::imfilter(sq, window, mc::Boundary::Replicate);
-        Mat structdis(im.rows, im.cols);
+        Mat structdis(im.rows, im.cols), sigma(im.rows, im.cols);
         for (size_t i = 0; i < im.numel(); ++i) {
-            double sigma = std::sqrt(std::fabs(ex2.d[i] - mu.d[i] * mu.d[i]));
-            structdis.d[i] = (im.d[i] - mu.d[i]) / (sigma + 1);
+            sigma.d[i] = std::sqrt(std::fabs(ex2.d[i] - mu.d[i] * mu.d[i]));
+            structdis.d[i] = (im.d[i] - mu.d[i]) / (sigma.d[i] + 1);
         }
-        // (the sharpness map of the original is computed but never used; omitted)
+        // sharpness = blkproc(sigma, [96 96], @computemean): computed by the official code but
+        // never used, so only in the faithful variant
+        if (faithful && scale == 1) {
+            double s = 0;
+            for (int j = 0; j < nbk; ++j)
+                for (int i = 0; i < mb; ++i) {
+                    const Mat blk = mc::crop(sigma, i * bs, j * bs, bs, bs);
+                    s += mc::mean(blk.d.data(), blk.numel());
+                }
+            g_unused_sink = s;
+        }
         const int b = bs / scale;
         double f[kFeat];
         for (int j = 0; j < nbk; ++j)
             for (int i = 0; i < mb; ++i) {
-                compute_feature(mc::crop(structdis, i * b, j * b, b, b), f);
+                compute_feature(mc::crop(structdis, i * b, j * b, b, b), f, faithful);
                 for (int k = 0; k < kFeat; ++k) feat(i + j * mb, (scale - 1) * kFeat + k) = f[k];
             }
         if (scale == 1) im = mc::imresize_scale(im, 0.5);

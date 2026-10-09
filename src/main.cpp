@@ -1,11 +1,12 @@
-// pi_eval: Perceptual Index (PIRM 2018) = ((10 - Ma) + NIQE) / 2, sequential C++ baseline.
+// pi_eval: Perceptual Index (PIRM 2018) = ((10 - Ma) + NIQE) / 2, sequential C++ version.
 //
 //   pi_eval [options] image1.png [image2.png ...]
 //     --models DIR        directory with ma_model.bin and niqe_params.bin (default: models)
 //     --pirm              treat RGB inputs like PIRM's calc_scores: Y channel of rgb2ycbcr,
 //                         then shave --shave pixels (default 4). Grey inputs are used as is.
 //     --shave N           border to remove (only with --pirm)
-//     --conv direct|separable   SSIM window filtering in M6 (default: separable)
+//     --faithful          run the faithful port: the same work as the official MATLAB code,
+//                         without the optimizations of the baseline (see variant.h). Slow.
 //     --dump FILE         write all features in the format of reference/run_reference.m
 //     --timing            print per-module times (M1..M8)
 //
@@ -35,7 +36,7 @@ struct Options {
     std::string models = "models";
     bool pirm = false;
     int shave = 4;
-    ConvMode conv = ConvMode::Separable;
+    Variant variant = Variant::Baseline;
     std::string dump;
     bool timing = false;
     std::vector<std::string> images;
@@ -52,12 +53,8 @@ Options parse(int argc, char** argv) {
         if (a == "--models") o.models = next();
         else if (a == "--pirm") o.pirm = true;
         else if (a == "--shave") o.shave = std::atoi(next().c_str());
-        else if (a == "--conv") {
-            std::string v = next();
-            if (v == "direct") o.conv = ConvMode::Direct;
-            else if (v == "separable") o.conv = ConvMode::Separable;
-            else throw std::runtime_error("--conv must be direct or separable");
-        } else if (a == "--dump") o.dump = next();
+        else if (a == "--faithful") o.variant = Variant::Faithful;
+        else if (a == "--dump") o.dump = next();
         else if (a == "--timing") o.timing = true;
         else if (!a.empty() && a[0] == '-') throw std::runtime_error("unknown option " + a);
         else o.images.push_back(a);
@@ -104,6 +101,7 @@ void dump_line(FILE* f, const std::string& name, double ma, double nq, const dou
 int main(int argc, char** argv) {
     try {
         Options o = parse(argc, argv);
+        std::setvbuf(stdout, nullptr, _IOLBF, 0);  // show progress when redirected
         MaModel ma_model;
         NiqeModel niqe_model;
         ma_model.load(o.models + "/ma_model.bin");
@@ -117,7 +115,7 @@ int main(int argc, char** argv) {
         for (const std::string& path : o.images) {
             Mat gray = load_gray(path, o);
             ModuleTimer timer;
-            MaFeatures feat = ma_features(gray, o.conv, &timer);
+            MaFeatures feat = ma_features(gray, o.variant, &timer);
             double s[3];
             {
                 ModuleTimer::Scope t(&timer, 8);
@@ -126,7 +124,7 @@ int main(int argc, char** argv) {
                 s[2] = ma_model.forest[2].predict(feat.f3);
             }
             const double ma = ma_model.score(s);
-            const double nq = niqe_score(gray, niqe_model, &timer);
+            const double nq = niqe_score(gray, niqe_model, o.variant, &timer);
             sum_ma += ma;
             sum_nq += nq;
             std::printf("%-32s %12.6f %12.6f %12.6f\n", basename(path).c_str(), ma, nq, ((10 - ma) + nq) / 2);

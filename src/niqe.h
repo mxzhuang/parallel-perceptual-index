@@ -6,6 +6,7 @@
 
 #include "matrix.h"
 #include "timer.h"
+#include "variant.h"
 
 struct NiqeModel {
     Vec mu;   // 36
@@ -14,4 +15,4 @@ struct NiqeModel {
 };
 
 // `gray`: uint8 grey levels (0..255). Returns the NIQE score.
-double niqe_score(const Mat& gray, const NiqeModel& model, ModuleTimer* timer);
+double niqe_score(const Mat& gray, const NiqeModel& model, Variant variant, ModuleTimer* timer);

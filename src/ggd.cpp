@@ -5,29 +5,56 @@
 
 #include "matlab_compat.h"
 
-GgdTable::GgdTable() {
-    g_ = mc::colon(0.03, 0.001, 10);
-    r_.resize(g_.size());
-    for (size_t i = 0; i < g_.size(); ++i) {
-        double g = g_[i];
-        double c = std::tgamma(2 / g);
-        r_[i] = std::tgamma(1 / g) * std::tgamma(3 / g) / (c * c);
+namespace {
+// g = 0.03:0.001:10; r = gamma(1./g).*gamma(3./g)./(gamma(2./g).^2)
+void build_ggd(Vec& g, Vec& r) {
+    g = mc::colon(0.03, 0.001, 10);
+    r.resize(g.size());
+    for (size_t i = 0; i < g.size(); ++i) {
+        double c = std::tgamma(2 / g[i]);
+        r[i] = std::tgamma(1 / g[i]) * std::tgamma(3 / g[i]) / (c * c);
     }
-    for (size_t i = 1; i < r_.size(); ++i)
-        if (!(r_[i] < r_[i - 1])) decreasing_ = false;
 }
 
-double GgdTable::fit_rho_bruteforce(double rho) const {
+// [~, idx] = min(abs(r - rho)): first minimum, NaN ignored
+size_t argmin_abs(const Vec& r, double rho) {
     size_t best = 0;
     double bd = std::numeric_limits<double>::quiet_NaN();
-    for (size_t i = 0; i < r_.size(); ++i) {
-        double d = std::fabs(r_[i] - rho);
+    for (size_t i = 0; i < r.size(); ++i) {
+        double d = std::fabs(r[i] - rho);
         if (std::isnan(bd) ? !std::isnan(d) : d < bd) {
             bd = d;
             best = i;
         }
     }
-    return g_[best];
+    return best;
+}
+
+// rho = var / (mean(abs(x - mean))^2 + 1e-7)
+double ggd_rho(const double* x, size_t n) {
+    double mu = mc::mean(x, n);
+    double v = mc::var(x, n);
+    double s = 0;
+    for (size_t i = 0; i < n; ++i) s += std::fabs(x[i] - mu);
+    double mean_abs = s / static_cast<double>(n);
+    mean_abs *= mean_abs;
+    return v / (mean_abs + 0.0000001);
+}
+}  // namespace
+
+GgdTable::GgdTable() {
+    build_ggd(g_, r_);
+    for (size_t i = 1; i < r_.size(); ++i)
+        if (!(r_[i] < r_[i - 1])) decreasing_ = false;
+}
+
+double GgdTable::fit_rho_bruteforce(double rho) const { return g_[argmin_abs(r_, rho)]; }
+
+double GgdTable::fit_faithful(const double* x, size_t n) {
+    const double rho = ggd_rho(x, n);
+    Vec g, r;
+    build_ggd(g, r);
+    return g[argmin_abs(r, rho)];
 }
 
 double GgdTable::fit_rho(double rho) const {
@@ -48,28 +75,32 @@ double GgdTable::fit_rho(double rho) const {
     return d_here < d_prev ? g_[lo] : g_[lo - 1];  // tie -> lower index, as MATLAB min
 }
 
-double GgdTable::fit(const double* x, size_t n) const {
-    double mu = mc::mean(x, n);
-    double v = mc::var(x, n);
-    double s = 0;
-    for (size_t i = 0; i < n; ++i) s += std::fabs(x[i] - mu);
-    double mean_abs = s / static_cast<double>(n);
-    mean_abs *= mean_abs;
-    double rho = v / (mean_abs + 0.0000001);
-    return fit_rho(rho);
-}
+double GgdTable::fit(const double* x, size_t n) const { return fit_rho(ggd_rho(x, n)); }
 
-AggdTable::AggdTable() {
-    gam_ = mc::colon(0.2, 0.001, 10);
-    r_.resize(gam_.size());
-    for (size_t i = 0; i < gam_.size(); ++i) {
-        double g = gam_[i];
-        double a = std::tgamma(2 / g);
-        r_[i] = (a * a) / (std::tgamma(1 / g) * std::tgamma(3 / g));
+// gam = 0.2:0.001:10; r_gam = ((gamma(2./gam)).^2)./(gamma(1./gam).*gamma(3./gam))
+void AggdTable::build(Vec& gam, Vec& r) {
+    gam = mc::colon(0.2, 0.001, 10);
+    r.resize(gam.size());
+    for (size_t i = 0; i < gam.size(); ++i) {
+        double a = std::tgamma(2 / gam[i]);
+        r[i] = (a * a) / (std::tgamma(1 / gam[i]) * std::tgamma(3 / gam[i]));
     }
 }
 
+AggdTable::AggdTable() { build(gam_, r_); }
+
 void AggdTable::fit(const double* x, size_t n, double& alpha, double& betal, double& betar) const {
+    fit_with(gam_, r_, x, n, alpha, betal, betar);
+}
+
+void AggdTable::fit_faithful(const double* x, size_t n, double& alpha, double& betal, double& betar) {
+    Vec gam, r;
+    build(gam, r);
+    fit_with(gam, r, x, n, alpha, betal, betar);
+}
+
+void AggdTable::fit_with(const Vec& gam, const Vec& r, const double* x, size_t n, double& alpha, double& betal,
+                         double& betar) {
     double sl = 0, sr = 0, sabs = 0, ssq = 0;
     size_t nl = 0, nr = 0;
     for (size_t i = 0; i < n; ++i) {
@@ -95,14 +126,14 @@ void AggdTable::fit(const double* x, size_t n, double& alpha, double& betal, dou
     // [~, pos] = min((r_gam - rhatnorm).^2): first minimum, NaN ignored (all NaN -> index 1)
     size_t best = 0;
     double bd = nan;
-    for (size_t i = 0; i < r_.size(); ++i) {
-        double d = (r_[i] - rhatnorm) * (r_[i] - rhatnorm);
+    for (size_t i = 0; i < r.size(); ++i) {
+        double d = (r[i] - rhatnorm) * (r[i] - rhatnorm);
         if (std::isnan(bd) ? !std::isnan(d) : d < bd) {
             bd = d;
             best = i;
         }
     }
-    alpha = gam_[best];
+    alpha = gam[best];
     double f = std::sqrt(std::tgamma(1 / alpha) / std::tgamma(3 / alpha));
     betal = leftstd * f;
     betar = rightstd * f;

@@ -9,8 +9,7 @@
 
 #include "matrix.h"
 #include "timer.h"
-
-enum class ConvMode { Direct, Separable };
+#include "variant.h"
 
 struct MaFeatures {
     Vec f1;  // 18 = 6 statistics x 3 scales
@@ -19,11 +18,11 @@ struct MaFeatures {
 };
 
 // `gray` holds uint8 grey levels (0..255) of the image, as the official code receives them.
-MaFeatures ma_features(const Mat& gray, ConvMode conv, ModuleTimer* timer);
+MaFeatures ma_features(const Mat& gray, Variant variant, ModuleTimer* timer);
 
 // Steerable pyramid as used by Ma (2 scales, 6 orientations). Exposed for testing.
 struct SteerablePyramid {
     Mat hi0;          // high-pass residual
     Mat band[2][6];   // [scale][orientation]
 };
-SteerablePyramid build_sf_pyramid(const Mat& im);
+SteerablePyramid build_sf_pyramid(const Mat& im, Variant variant = Variant::Baseline);

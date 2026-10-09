@@ -35,12 +35,30 @@ Perceptual Index over 2 image(s): 4.694971  (mean Ma 6.402247, mean NIQE 5.79218
 | `--timing` | Per-stage run time |
 | `--models DIR` | Model directory (default `models`) |
 
+| `--faithful` | Do exactly the work of the official code (slow; for profiling) |
+
 ## Testing
 
 ```bash
 make check   # compares against reference outputs of the official code
 ```
 
+## Profiling
+
+Per-stage timing (M1–M8) of three sequential versions, pinned to one core:
+
+```bash
+# 1. Official MATLAB code (clone chaoma99/sr-metric and roimehrez/PIRM2018 first)
+matlab -batch "maxNumCompThreads(1); addpath('reference'); \
+  time_official_modules('tests/images/coffee_y.png', 'sr-metric', 'PIRM2018/utils/niqe_release', '', 3)"
+
+# 2. Faithful C++ port: same work as the official code
+taskset -c 0 ./pi_eval --faithful --timing tests/images/*_y.png
+
+# 3. Optimized C++ baseline: redundant work removed, same output
+taskset -c 0 ./pi_eval --timing tests/images/*_y.png
+```
+
 ## Credits
 
-Based on the official implementations of [Ma et al.](https://github.com/chaoma99/sr-metric) (CVIU 2017) and NIQE ([Mittal et al.](https://github.com/roimehrez/PIRM2018), IEEE SPL 2013). Please cite the original papers.
+Based on the official implementations of [Ma et al.](https://github.com/chaoma99/sr-metric) (CVIU 2017) and NIQE ([Mittal et al.](https://github.com/roimehrez/PIRM2018), IEEE SPL 2013). Please cite the original papers. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
