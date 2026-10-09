@@ -45,7 +45,7 @@ make check   # compares against reference outputs of the official code
 
 ## Profiling
 
-Per-stage timing (M1–M8) of three sequential versions, pinned to one core:
+Profile three sequential versions, single-threaded:
 
 ```bash
 # 1. Official MATLAB code (clone chaoma99/sr-metric and roimehrez/PIRM2018 first)
@@ -53,11 +53,13 @@ matlab -batch "maxNumCompThreads(1); addpath('reference'); \
   time_official_modules('tests/images/coffee_y.png', 'sr-metric', 'PIRM2018/utils/niqe_release', '', 3)"
 
 # 2. Faithful C++ port: same work as the official code
-taskset -c 0 ./pi_eval --faithful --timing tests/images/*_y.png
+bash tools/profile.sh --faithful -n 1 tests/images/chelsea_y.png
 
 # 3. Optimized C++ baseline: redundant work removed, same output
-taskset -c 0 ./pi_eval --timing tests/images/*_y.png
+bash tools/profile.sh -n 5 tests/images/*_y.png
 ```
+
+`tools/profile.sh` runs `time`, per-stage timing (median of `-n` runs), `gprof` and `perf`, and writes a summary to `profile_results/`.
 
 ## Credits
 

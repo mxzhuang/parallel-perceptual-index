@@ -8,7 +8,7 @@
 //     --faithful          run the faithful port: the same work as the official MATLAB code,
 //                         without the optimizations of the baseline (see variant.h). Slow.
 //     --dump FILE         write all features in the format of reference/run_reference.m
-//     --timing            print per-module times (M1..M8)
+//     --timing            print per-module times (M1..M8) and I/O time
 //
 // Without --pirm an RGB input is converted with rgb2gray, as quality_predict.m does.
 
@@ -102,19 +102,26 @@ int main(int argc, char** argv) {
     try {
         Options o = parse(argc, argv);
         std::setvbuf(stdout, nullptr, _IOLBF, 0);  // show progress when redirected
+        ModuleTimer total;
         MaModel ma_model;
         NiqeModel niqe_model;
-        ma_model.load(o.models + "/ma_model.bin");
-        niqe_model.load(o.models + "/niqe_params.bin");
+        {
+            ModuleTimer::Scope t(&total, 0);
+            ma_model.load(o.models + "/ma_model.bin");
+            niqe_model.load(o.models + "/niqe_params.bin");
+        }
         FILE* dump = o.dump.empty() ? nullptr : std::fopen(o.dump.c_str(), "w");
         if (!o.dump.empty() && !dump) throw std::runtime_error("cannot write " + o.dump);
 
         double sum_ma = 0, sum_nq = 0;
-        ModuleTimer total;
         std::printf("%-32s %12s %12s %12s\n", "image", "Ma", "NIQE", "PI");
         for (const std::string& path : o.images) {
-            Mat gray = load_gray(path, o);
             ModuleTimer timer;
+            Mat gray;
+            {
+                ModuleTimer::Scope t(&timer, 0);
+                gray = load_gray(path, o);
+            }
             MaFeatures feat = ma_features(gray, o.variant, &timer);
             double s[3];
             {
@@ -133,7 +140,7 @@ int main(int argc, char** argv) {
                 for (int m = 1; m <= 8; ++m) std::printf("  M%d %.3f", m, timer.seconds[m]);
                 std::printf("\n");
             }
-            for (int m = 1; m <= 8; ++m) total.seconds[m] += timer.seconds[m];
+            for (int m = 0; m <= 8; ++m) total.seconds[m] += timer.seconds[m];
             if (dump) dump_line(dump, basename(path), ma, nq, s, feat);
         }
         const double n = static_cast<double>(o.images.size());
@@ -144,7 +151,7 @@ int main(int argc, char** argv) {
             for (int m = 1; m <= 8; ++m) all += total.seconds[m];
             std::printf("Total time per module [s]:");
             for (int m = 1; m <= 8; ++m) std::printf("  M%d %.3f (%.1f%%)", m, total.seconds[m], 100 * total.seconds[m] / all);
-            std::printf("\n");
+            std::printf("  I/O %.3f\n", total.seconds[0]);
         }
         if (dump) std::fclose(dump);
     } catch (const std::exception& e) {

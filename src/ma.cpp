@@ -17,7 +17,7 @@ struct SpatialPyramid {
     Mat im[3];  // full, half, quarter resolution, values in [0, 1]
 };
 
-SpatialPyramid spatial_pyramid(const Mat& gray) {
+PI_NOINLINE SpatialPyramid spatial_pyramid(const Mat& gray) {
     SpatialPyramid p;
     p.im[0] = gray;
     for (double& v : p.im[0].d) v /= 255.0;  // im2double
@@ -37,7 +37,7 @@ double std_over_mean(const double* a, size_t n, double eps) {
 // mean of sorted values in [from, to)
 double mean_range(const Vec& s, size_t from, size_t to) { return mc::mean(s.data() + from, to - from); }
 
-void block_dct(const Mat& im, double out[6], Variant variant) {
+PI_NOINLINE void block_dct(const Mat& im, double out[6], Variant variant) {
     const bool faithful = variant == Variant::Faithful;
     const int R = im.rows, C = im.cols;
     const int nbr = (R + 2) / 3, nbc = (C + 2) / 3;
@@ -101,7 +101,7 @@ void block_dct(const Mat& im, double out[6], Variant variant) {
 // ============================================================================
 // M3: patch SVD (svd(im2col(im, [5 5], 'distinct')))
 // ============================================================================
-Vec patch_svd(const Mat& im) { return mc::singular_values_wide(mc::im2col_distinct(im, 5, 5)); }
+PI_NOINLINE Vec patch_svd(const Mat& im) { return mc::singular_values_wide(mc::im2col_distinct(im, 5, 5)); }
 
 // ============================================================================
 // M4: steerable pyramid in the frequency domain (matlabPyrTools buildSFpyr / buildSFpyrLevs)
@@ -205,7 +205,7 @@ void sf_levels(CMat lodft, Mat log_rad, Mat angle, Vec Xrcos, const Vec& Yrcos, 
 }
 }  // namespace
 
-SteerablePyramid build_sf_pyramid(const Mat& im, Variant variant) {
+PI_NOINLINE SteerablePyramid build_sf_pyramid(const Mat& im, Variant variant) {
     const int R = im.rows, C = im.cols;
     const int ht = 2;
     if (ht > static_cast<int>(std::floor(std::log2(std::min(R, C)))) - 2)
@@ -276,7 +276,7 @@ void unused_histogram(const Vec& x, int nbins) {
     g_unused_sink = hy[0];
 }
 
-NormalizedBands divisive_normalization(const SteerablePyramid& pyr, Variant variant) {
+PI_NOINLINE NormalizedBands divisive_normalization(const SteerablePyramid& pyr, Variant variant) {
     NormalizedBands out;
     const int Nor = 6, Nband = 13;  // size(pind,1) - 1
     int p = 0;
@@ -406,7 +406,7 @@ const SsimWindow& ssim_window() {
 // mcs = mean2(cs_map), cs_map = (2 sigma12 + C2) / (sigma1^2 + sigma2^2 + C2)
 // Baseline: separable window, only the structure term. Faithful: direct 11x11 window and the
 // full ssim_map / mssim as well, which the official code computes but Ma does not use.
-double ssim_structure(const Mat& a, const Mat& b, Variant variant) {
+PI_NOINLINE double ssim_structure(const Mat& a, const Mat& b, Variant variant) {
     const bool faithful = variant == Variant::Faithful;
     const SsimWindow& w = ssim_window();
     auto filt = [&](const Mat& x) {

@@ -3,8 +3,12 @@
 
 #include <chrono>
 
+// Keep each module a separate function in gprof / perf output (inlining a function that runs
+// once per image saves nothing).
+#define PI_NOINLINE __attribute__((noinline))
+
 struct ModuleTimer {
-    double seconds[9] = {0};  // index 1..8 = M1..M8
+    double seconds[9] = {0};  // index 0 = I/O (model loading, image decoding), 1..8 = M1..M8
 
     struct Scope {
         ModuleTimer* t;
