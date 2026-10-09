@@ -1,0 +1,13 @@
+# build outputs
+*.o
+pi_eval
+tests/test_ggd
+tests/cpp_dump.txt
+# converted models: run tools/fetch_models.sh
+models/*.bin
+__pycache__/
+pi_eval_gprof
+build/
+profile_results/
+gmon.out
+perf.data*
