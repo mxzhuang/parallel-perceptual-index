@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <stdexcept>
 
 #include "ggd.h"
 #include "matlab_compat.h"
@@ -19,12 +18,14 @@ double std_over_mean(const double* a, size_t n, double eps) {
 // mean of sorted values in [from, to)
 double mean_range(const Vec& s, size_t from, size_t to) { return mc::mean(s.data() + from, to - from); }
 
-PI_NOINLINE void block_dct(const Mat& im, double out[6], const Config& cfg) {
-    const bool faithful = cfg.variant == Variant::Faithful;
+// Statistics of the windows in columns [bc_lo, bc_hi). The 7x7 window, its DCT and the
+// scratch arrays are locals of the call, so each chunk of a parallel loop has its own
+// copies; the image and the tables are only read. Outputs are indexed k = br + bc * nbr:
+// a range of window columns is one contiguous slice of gama, cv and ori that no other
+// chunk writes.
+void window_columns(const Mat& im, int bc_lo, int bc_hi, bool faithful, Vec& gama, Vec& cv, Vec& ori) {
     const int R = im.rows, C = im.cols;
-    const int nbr = (R + 2) / 3, nbc = (C + 2) / 3;
-    const size_t nb = static_cast<size_t>(nbr) * nbc;
-    Vec gama(nb), cv(nb), ori(nb);
+    const int nbr = (R + 2) / 3;
     static const mc::Dct2 dct(7);
     const GgdTable& ggd = ggd_table();
 
@@ -37,7 +38,7 @@ PI_NOINLINE void block_dct(const Mat& im, double out[6], const Config& cfg) {
                                 {4, 1}, {5, 1}, {6, 1}, {4, 2}, {5, 2}, {6, 2}, {5, 3}, {6, 3}};
 
     double win[49], D[49], a48[48], a16[16];
-    for (int bc = 0; bc < nbc; ++bc)
+    for (int bc = bc_lo; bc < bc_hi; ++bc)
         for (int br = 0; br < nbr; ++br) {
             // blkproc(im, [3 3], [2 2]): 7x7 window, zero outside the image
             for (int c = 0; c < 7; ++c)
@@ -65,10 +66,37 @@ PI_NOINLINE void block_dct(const Mat& im, double out[6], const Config& cfg) {
             }
             ori[k] = mc::var(g, 3);
         }
+}
 
-    std::sort(gama.begin(), gama.end());
-    std::sort(cv.begin(), cv.end());
-    std::sort(ori.begin(), ori.end());
+PI_NOINLINE void block_dct(const Mat& im, double out[6], const Config& cfg) {
+    const bool faithful = cfg.variant == Variant::Faithful;
+    const int nbr = (im.rows + 2) / 3, nbc = (im.cols + 2) / 3;
+    const size_t nb = static_cast<size_t>(nbr) * nbc;
+    Vec gama(nb), cv(nb), ori(nb);
+    Vec* stat[3] = {&gama, &cv, &ori};
+
+    if (cfg.designed()) {
+        // Windows are independent and cost about the same, so a static block partition
+        // balances the columns with one chunk per thread and a single false-sharing border
+        // between neighbours. schedule(static,1) deals the columns out cyclically instead:
+        // neighbouring columns go to different threads, every slice border becomes a cache
+        // line written by two threads, the image columns shared by overlapping windows are
+        // loaded into several caches, and each column pays the cost of starting a chunk.
+        par_for(cfg, nbc, cfg.m2_sched, [&](long lo, long hi) {
+            window_columns(im, static_cast<int>(lo), static_cast<int>(hi), faithful, gama, cv, ori);
+        }, cfg.load_m2);
+        // The 10% tails are defined over the whole scale with exact sample counts, so the
+        // chunks cannot pool their own slices. The three full sorts are independent (one
+        // array each) and of unequal cost: three units handed out one at a time.
+        par_for(cfg, 3, Sched{SchedKind::Dynamic, 1}, [&](long lo, long hi) {
+            for (long i = lo; i < hi; ++i) std::sort(stat[i]->begin(), stat[i]->end());
+        });
+    } else {
+        window_columns(im, 0, nbc, faithful, gama, cv, ori);
+        for (Vec* v : stat) std::sort(v->begin(), v->end());
+    }
+
+    // sums over sorted values, in index order: the same for every thread count
     const double cnt = static_cast<double>(nb);
     const size_t first10 = static_cast<size_t>(std::ceil(cnt * 0.1));
     const size_t last10 = static_cast<size_t>(std::trunc(cnt * 0.9));  // MATLAB fix(), 1-based start
@@ -82,5 +110,7 @@ PI_NOINLINE void block_dct(const Mat& im, double out[6], const Config& cfg) {
 }  // namespace
 
 void m2_block_dct(const SpatialPyramid& sp, double f1[18], const Config& cfg) {
-    for (int s = 0; s < 3; ++s) block_dct(sp.im[s], &f1[6 * s], cfg);
+    // Each scale writes its own six outputs. In the task graph the three scales overlap;
+    // elsewhere they run in turn and the window loop gets every thread.
+    par_outer(cfg, 3, [&](int s) { block_dct(sp.im[s], &f1[6 * s], cfg); });
 }
