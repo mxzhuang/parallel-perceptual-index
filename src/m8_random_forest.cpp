@@ -11,7 +11,8 @@ void read_into(FILE* f, T* dst, size_t n) {
 }
 }  // namespace
 
-double RegForest::predict(const Vec& x) const {
+double RegForest::predict(const Vec& x, const Config& cfg) const {
+    (void)cfg;
     double sum = 0;
     for (const RegTree& t : trees) {
         int k = 0;
@@ -22,6 +23,10 @@ double RegForest::predict(const Vec& x) const {
         sum += t.value[k];
     }
     return sum / static_cast<double>(trees.size());
+}
+
+void RegForest::predict_batch(const std::vector<const Vec*>& xs, double* out, const Config& cfg) const {
+    for (size_t i = 0; i < xs.size(); ++i) out[i] = predict(*xs[i], cfg);
 }
 
 void MaModel::load(const std::string& path) {

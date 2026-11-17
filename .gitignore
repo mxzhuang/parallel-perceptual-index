@@ -1,13 +1,22 @@
 # build outputs
 *.o
+build/
 pi_eval
+pi_eval_seq
+pi_eval_gprof
+pi_eval_cuda
+cuda/build/
 tests/test_ggd
 tests/cpp_dump.txt
+tests/out/
+__pycache__/
 # converted models: run tools/fetch_models.sh
 models/*.bin
-__pycache__/
-pi_eval_gprof
-build/
+# profiling
 profile_results/
 gmon.out
 perf.data*
+# experiment tooling: datasets, results and the Python environment (see docs/EXPERIMENTS.md)
+data/
+results/
+.venv/

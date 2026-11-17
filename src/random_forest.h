@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "config.h"
 #include "matrix.h"
 
 struct RegTree {
@@ -17,7 +18,11 @@ struct RegTree {
 
 struct RegForest {
     std::vector<RegTree> trees;
-    double predict(const Vec& x) const;
+    // Mean leaf value over all trees for one feature vector.
+    double predict(const Vec& x, const Config& cfg) const;
+    // Predictions for a batch of feature vectors (out[i] for *xs[i]); with
+    // cfg.rf_order == TreeMajor every tree is applied to the whole batch before the next one.
+    void predict_batch(const std::vector<const Vec*>& xs, double* out, const Config& cfg) const;
 };
 
 struct MaModel {

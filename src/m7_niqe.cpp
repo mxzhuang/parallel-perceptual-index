@@ -1,4 +1,4 @@
-#include "niqe.h"
+#include "modules.h"
 
 #include <cmath>
 #include <cstdio>
@@ -56,9 +56,8 @@ void compute_feature(const Mat& block, double* feat, bool faithful) {
 }
 }  // namespace
 
-double niqe_score(const Mat& gray, const NiqeModel& model, Variant variant, ModuleTimer* timer) {
-    const bool faithful = variant == Variant::Faithful;
-    ModuleTimer::Scope t(timer, 7);
+PI_NOINLINE double m7_niqe(const Mat& gray, const NiqeModel& model, const Config& cfg) {
+    const bool faithful = cfg.variant == Variant::Faithful;
     const int bs = 96;
     const int mb = gray.rows / bs, nbk = gray.cols / bs;
     if (mb == 0 || nbk == 0) return std::nan("");

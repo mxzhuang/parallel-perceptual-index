@@ -1,22 +1,39 @@
 CXX      ?= g++
 # -g only adds debug symbols (for perf); it does not change the generated code.
 # No -ffast-math: the port must keep IEEE semantics to match the reference.
-CXXFLAGS ?= -O2 -g -std=c++17 -Wall -Wextra
-SRC  = src/main.cpp src/ma.cpp src/niqe.cpp src/ggd.cpp src/matlab_compat.cpp src/random_forest.cpp
-OBJ  = $(SRC:.cpp=.o)
-BIN  = pi_eval
+# -ffp-contract=off: never fuse a multiply and an add, so every build rounds the same way
+# (plain x86-64 has no FMA, so this changes nothing there; it matters with -march or on ARM).
+CXXFLAGS ?= -O2 -g -std=c++17 -Wall -Wextra -ffp-contract=off
+OMPFLAGS ?= -fopenmp
 
-all: $(BIN)
+SRC = $(wildcard src/*.cpp)
+HDR = $(wildcard src/*.h)
 
-$(BIN): $(OBJ)
-	$(CXX) $(CXXFLAGS) -o $@ $(OBJ)
+# pi_eval      all versions (sequential baseline and the OpenMP versions), built with OpenMP
+# pi_eval_seq  the same sources without OpenMP: every pragma is ignored, so this binary is
+#              the pure sequential baseline that speedups are measured against
+OMP_OBJ = $(SRC:src/%.cpp=build/omp/%.o)
+SEQ_OBJ = $(SRC:src/%.cpp=build/seq/%.o)
 
-src/main.o build/gprof/main.o: CXXFLAGS += -Wno-unused-function -Wno-missing-field-initializers
+all: pi_eval pi_eval_seq
 
-%.o: %.cpp src/*.h
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+pi_eval: $(OMP_OBJ)
+	$(CXX) $(CXXFLAGS) $(OMPFLAGS) -o $@ $(OMP_OBJ)
 
-# gprof build: same code instrumented with -pg (writes gmon.out when it exits)
+pi_eval_seq: $(SEQ_OBJ)
+	$(CXX) $(CXXFLAGS) -o $@ $(SEQ_OBJ)
+
+build/omp/%.o: src/%.cpp $(HDR)
+	@mkdir -p build/omp
+	$(CXX) $(CXXFLAGS) $(OMPFLAGS) -c $< -o $@
+
+build/seq/%.o: src/%.cpp $(HDR)
+	@mkdir -p build/seq
+	$(CXX) $(CXXFLAGS) -Wno-unknown-pragmas -c $< -o $@
+
+build/omp/image_io.o build/seq/image_io.o build/gprof/image_io.o: CXXFLAGS += -Wno-unused-function -Wno-missing-field-initializers
+
+# gprof build of the sequential baseline (writes gmon.out when it exits)
 GPROF_OBJ = $(SRC:src/%.cpp=build/gprof/%.o)
 
 gprof: pi_eval_gprof
@@ -24,27 +41,31 @@ gprof: pi_eval_gprof
 pi_eval_gprof: $(GPROF_OBJ)
 	$(CXX) $(CXXFLAGS) -pg -o $@ $(GPROF_OBJ)
 
-build/gprof/%.o: src/%.cpp src/*.h
+build/gprof/%.o: src/%.cpp $(HDR)
 	@mkdir -p build/gprof
-	$(CXX) $(CXXFLAGS) -pg -c $< -o $@
+	$(CXX) $(CXXFLAGS) -Wno-unknown-pragmas -pg -c $< -o $@
 
-test: $(BIN)
-	./$(BIN) --timing tests/images/*_y.png
+test: pi_eval
+	./pi_eval --timing tests/images/*_y.png
 
-# accuracy checks: GGD lookup equivalence + comparison with the official reference
-check: $(BIN) tests/test_ggd
+# Accuracy checks:
+#   1. GGD lookup: binary search returns the same index as the linear search
+#   2. sequential baseline against the reference outputs of the official code
+#   3. every parallel configuration against the sequential baseline
+check: pi_eval pi_eval_seq tests/test_ggd
 	./tests/test_ggd
-	./$(BIN) --dump tests/cpp_dump.txt tests/images/*_y.png > /dev/null
+	./pi_eval_seq --dump tests/cpp_dump.txt tests/images/*_y.png > /dev/null
 	python3 tests/compare.py reference/octave_reference.txt tests/cpp_dump.txt
+	python3 tests/check_parallel.py
 
-tests/test_ggd: tests/test_ggd.cpp src/ggd.cpp src/matlab_compat.cpp src/*.h
+tests/test_ggd: tests/test_ggd.cpp src/ggd.cpp src/matlab_compat.cpp $(HDR)
 	$(CXX) $(CXXFLAGS) tests/test_ggd.cpp src/ggd.cpp src/matlab_compat.cpp -o $@
 
 # profiling with time, gprof and perf (see tools/profile.sh)
-profile: $(BIN) pi_eval_gprof
+profile: pi_eval_seq pi_eval_gprof
 	bash tools/profile.sh tests/images/*_y.png
 
 clean:
-	rm -rf $(OBJ) $(BIN) pi_eval_gprof build tests/test_ggd tests/cpp_dump.txt
+	rm -rf build pi_eval pi_eval_seq pi_eval_gprof tests/test_ggd tests/cpp_dump.txt tests/out
 
 .PHONY: all gprof test check profile clean

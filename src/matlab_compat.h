@@ -5,6 +5,7 @@
 
 #include <cstdint>
 
+#include "config.h"
 #include "matrix.h"
 
 namespace mc {
@@ -40,6 +41,9 @@ Mat im2col_distinct(const Mat& a, int m, int n);
 // antialiasing when shrinking, symmetric boundary handling.
 Mat imresize_scale(const Mat& a, double scale);
 Mat imresize_size(const Mat& a, int out_rows, int out_cols);
+// The same, with the loop over columns run in parallel as cfg allows (identical output).
+Mat imresize_scale(const Mat& a, double scale, const Config& cfg);
+Mat imresize_size(const Mat& a, int out_rows, int out_cols, const Config& cfg);
 // circshift(A, [dr dc])
 Mat circshift(const Mat& a, int dr, int dc);
 
@@ -56,13 +60,6 @@ private:
     int n_;
     Vec c_;  // n x n, column-major
 };
-
-// Complex FFT of arbitrary length (radix-2 for powers of two, Bluestein otherwise).
-void fft_inplace(std::vector<cplx>& x, bool inverse);
-CMat fft2(const Mat& a);
-CMat ifft2(const CMat& a);  // includes the 1/(m*n) scaling
-CMat fftshift(const CMat& a);
-CMat ifftshift(const CMat& a);
 
 // ---- small dense linear algebra ---------------------------------------------------
 // Eigen-decomposition of a symmetric matrix (cyclic Jacobi). vecs columns are eigenvectors.

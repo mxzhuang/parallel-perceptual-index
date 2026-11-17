@@ -1,4 +1,4 @@
-// Per-module wall-clock timing (M1..M8), used for profiling the sequential baseline.
+// Per-module wall-clock timing (M1..M8).
 #pragma once
 
 #include <chrono>

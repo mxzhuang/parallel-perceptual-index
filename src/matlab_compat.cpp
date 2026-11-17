@@ -5,6 +5,8 @@
 #include <cmath>
 #include <stdexcept>
 
+#include "parallel.h"
+
 namespace mc {
 
 namespace {
@@ -234,47 +236,57 @@ Contrib contributions(int in_len, int out_len, double scale) {
     return ct;
 }
 
-Mat resize_rows(const Mat& a, int out_rows, double scale) {
-    Contrib ct = contributions(a.rows, out_rows, scale);
+// Both passes write whole output columns, which are contiguous in memory, so the loop over
+// columns can be split among threads without two threads sharing a cache line (except at
+// chunk borders). Every output value is computed exactly as in the serial loop.
+Mat resize_rows(const Mat& a, int out_rows, double scale, const Config& cfg) {
+    const Contrib ct = contributions(a.rows, out_rows, scale);
     Mat o(out_rows, a.cols);
-    for (int c = 0; c < a.cols; ++c)
-        for (int i = 0; i < out_rows; ++i) {
-            double s = 0;
-            for (int k = 0; k < ct.P; ++k) s += ct.w[i * ct.P + k] * a(ct.idx[i * ct.P + k], c);
-            o(i, c) = s;
-        }
+    par_for(cfg, a.cols, Sched{}, [&](long clo, long chi) {
+        for (int c = static_cast<int>(clo); c < chi; ++c)
+            for (int i = 0; i < out_rows; ++i) {
+                double s = 0;
+                for (int k = 0; k < ct.P; ++k) s += ct.w[i * ct.P + k] * a(ct.idx[i * ct.P + k], c);
+                o(i, c) = s;
+            }
+    });
     return o;
 }
 
-Mat resize_cols(const Mat& a, int out_cols, double scale) {
-    Contrib ct = contributions(a.cols, out_cols, scale);
+Mat resize_cols(const Mat& a, int out_cols, double scale, const Config& cfg) {
+    const Contrib ct = contributions(a.cols, out_cols, scale);
     Mat o(a.rows, out_cols);
-    for (int i = 0; i < out_cols; ++i)
-        for (int r = 0; r < a.rows; ++r) {
-            double s = 0;
-            for (int k = 0; k < ct.P; ++k) s += ct.w[i * ct.P + k] * a(r, ct.idx[i * ct.P + k]);
-            o(r, i) = s;
-        }
+    par_for(cfg, out_cols, Sched{}, [&](long clo, long chi) {
+        for (int i = static_cast<int>(clo); i < chi; ++i)
+            for (int r = 0; r < a.rows; ++r) {
+                double s = 0;
+                for (int k = 0; k < ct.P; ++k) s += ct.w[i * ct.P + k] * a(r, ct.idx[i * ct.P + k]);
+                o(r, i) = s;
+            }
+    });
     return o;
 }
 
-Mat resize_impl(const Mat& a, int out_r, int out_c, double sr, double sc) {
+Mat resize_impl(const Mat& a, int out_r, int out_c, double sr, double sc, const Config& cfg) {
     // MATLAB processes dimensions in ascending order of scale (stable sort)
-    if (sr <= sc) return resize_cols(resize_rows(a, out_r, sr), out_c, sc);
-    return resize_rows(resize_cols(a, out_c, sc), out_r, sr);
+    if (sr <= sc) return resize_cols(resize_rows(a, out_r, sr, cfg), out_c, sc, cfg);
+    return resize_rows(resize_cols(a, out_c, sc, cfg), out_r, sr, cfg);
 }
 }  // namespace
 
-Mat imresize_scale(const Mat& a, double scale) {
+Mat imresize_scale(const Mat& a, double scale, const Config& cfg) {
     int out_r = static_cast<int>(std::ceil(scale * a.rows));
     int out_c = static_cast<int>(std::ceil(scale * a.cols));
-    return resize_impl(a, out_r, out_c, scale, scale);
+    return resize_impl(a, out_r, out_c, scale, scale, cfg);
 }
 
-Mat imresize_size(const Mat& a, int out_rows, int out_cols) {
+Mat imresize_size(const Mat& a, int out_rows, int out_cols, const Config& cfg) {
     return resize_impl(a, out_rows, out_cols, static_cast<double>(out_rows) / a.rows,
-                       static_cast<double>(out_cols) / a.cols);
+                       static_cast<double>(out_cols) / a.cols, cfg);
 }
+
+Mat imresize_scale(const Mat& a, double scale) { return imresize_scale(a, scale, Config{}); }
+Mat imresize_size(const Mat& a, int out_rows, int out_cols) { return imresize_size(a, out_rows, out_cols, Config{}); }
 
 Mat circshift(const Mat& a, int dr, int dc) {
     Mat o(a.rows, a.cols);
@@ -312,147 +324,6 @@ void Dct2::apply(const double* in, double* out) const {
             out[c * n + r] = s;
         }
 }
-
-namespace {
-bool is_pow2(size_t n) { return n && !(n & (n - 1)); }
-
-// Precomputed tables for one transform length: radix-2 for powers of two, Bluestein
-// (chirp-z through a power-of-two convolution) otherwise. Only the forward transform is
-// implemented; the inverse uses ifft(x) = conj(fft(conj(x))) / n.
-class FftPlan {
-public:
-    explicit FftPlan(size_t n) : n_(n), pow2_(is_pow2(n)) {
-        size_t L = n;
-        if (!pow2_) {
-            m_ = 1;
-            while (m_ < 2 * n - 1) m_ <<= 1;
-            L = m_;
-        }
-        init_radix2(L);
-        if (!pow2_) {
-            chirp_.resize(n);
-            for (size_t k = 0; k < n; ++k) {
-                unsigned long long kk = (static_cast<unsigned long long>(k) * k) % (2ULL * n);
-                chirp_[k] = std::polar(1.0, -kPi * static_cast<double>(kk) / static_cast<double>(n));
-            }
-            bhat_.assign(m_, cplx(0, 0));
-            bhat_[0] = std::conj(chirp_[0]);
-            for (size_t k = 1; k < n; ++k) bhat_[k] = bhat_[m_ - k] = std::conj(chirp_[k]);
-            radix2(bhat_.data(), false);
-        }
-    }
-
-    // in-place forward DFT of x[0..n), work must hold m() elements (unused for powers of two)
-    void forward(cplx* x, cplx* work) const {
-        if (n_ <= 1) return;
-        if (pow2_) {
-            radix2(x, false);
-            return;
-        }
-        for (size_t k = 0; k < n_; ++k) work[k] = x[k] * chirp_[k];
-        for (size_t k = n_; k < m_; ++k) work[k] = 0;
-        radix2(work, false);
-        for (size_t i = 0; i < m_; ++i) work[i] *= bhat_[i];
-        radix2(work, true);
-        const double s = 1.0 / static_cast<double>(m_);
-        for (size_t k = 0; k < n_; ++k) x[k] = chirp_[k] * work[k] * s;
-    }
-    size_t work_size() const { return pow2_ ? 0 : m_; }
-
-private:
-    size_t n_, m_ = 0;
-    bool pow2_;
-    std::vector<size_t> rev_;
-    std::vector<cplx> tw_;  // exp(-2 pi i k / L), k < L/2
-    std::vector<cplx> chirp_, bhat_;
-
-    void init_radix2(size_t L) {
-        rev_.resize(L);
-        for (size_t i = 0, j = 0; i < L; ++i) {
-            rev_[i] = j;
-            size_t bit = L >> 1;
-            for (; bit && (j & bit); bit >>= 1) j ^= bit;
-            j ^= bit;
-        }
-        tw_.resize(L / 2);
-        for (size_t k = 0; k < L / 2; ++k) tw_[k] = std::polar(1.0, -2 * kPi * static_cast<double>(k) / static_cast<double>(L));
-    }
-
-    void radix2(cplx* a, bool inverse) const {
-        const size_t L = rev_.size();
-        for (size_t i = 0; i < L; ++i)
-            if (i < rev_[i]) std::swap(a[i], a[rev_[i]]);
-        for (size_t len = 2; len <= L; len <<= 1) {
-            const size_t half = len / 2, step = L / len;
-            for (size_t i = 0; i < L; i += len)
-                for (size_t k = 0; k < half; ++k) {
-                    cplx w = inverse ? std::conj(tw_[k * step]) : tw_[k * step];
-                    cplx u = a[i + k], v = a[i + k + half] * w;
-                    a[i + k] = u + v;
-                    a[i + k + half] = u - v;
-                }
-        }
-    }
-};
-
-// transform every column (dim 1) then every row (dim 2)
-void fft2_inplace(CMat& o, bool inverse) {
-    const FftPlan pr(o.rows), pc(o.cols);
-    std::vector<cplx> buf(std::max(o.rows, o.cols));
-    std::vector<cplx> work(std::max(pr.work_size(), pc.work_size()));
-    auto run = [&](const FftPlan& p, cplx* x, size_t n) {
-        if (inverse)
-            for (size_t i = 0; i < n; ++i) x[i] = std::conj(x[i]);
-        p.forward(x, work.data());
-        if (inverse)
-            for (size_t i = 0; i < n; ++i) x[i] = std::conj(x[i]);
-    };
-    for (int c = 0; c < o.cols; ++c) run(pr, &o.d[static_cast<size_t>(c) * o.rows], o.rows);
-    for (int r = 0; r < o.rows; ++r) {
-        for (int c = 0; c < o.cols; ++c) buf[c] = o(r, c);
-        run(pc, buf.data(), o.cols);
-        for (int c = 0; c < o.cols; ++c) o(r, c) = buf[c];
-    }
-}
-}  // namespace
-
-void fft_inplace(std::vector<cplx>& x, bool inverse) {
-    if (x.size() <= 1) return;
-    FftPlan p(x.size());
-    std::vector<cplx> work(p.work_size());
-    if (inverse)
-        for (cplx& v : x) v = std::conj(v);
-    p.forward(x.data(), work.data());
-    if (inverse)
-        for (cplx& v : x) v = std::conj(v);
-}
-
-CMat fft2(const Mat& a) {
-    CMat o(a.rows, a.cols);
-    for (size_t i = 0; i < a.numel(); ++i) o.d[i] = a.d[i];
-    fft2_inplace(o, false);
-    return o;
-}
-
-CMat ifft2(const CMat& a) {
-    CMat o = a;
-    fft2_inplace(o, true);
-    const double s = 1.0 / (static_cast<double>(a.rows) * a.cols);
-    for (cplx& v : o.d) v *= s;
-    return o;
-}
-
-namespace {
-CMat shift2(const CMat& a, int pr, int pc) {
-    CMat o(a.rows, a.cols);
-    for (int c = 0; c < a.cols; ++c)
-        for (int r = 0; r < a.rows; ++r) o(r, c) = a((r + pr) % a.rows, (c + pc) % a.cols);
-    return o;
-}
-}  // namespace
-
-CMat fftshift(const CMat& a) { return shift2(a, (a.rows + 1) / 2, (a.cols + 1) / 2); }
-CMat ifftshift(const CMat& a) { return shift2(a, a.rows / 2, a.cols / 2); }
 
 // ---- small dense linear algebra ---------------------------------------------------
 
