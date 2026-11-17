@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Profile pi_eval with the tools introduced in HW0 (time, gprof, perf) plus repeated
-# per-module timing. Results are written to profile_results/<variant>/.
+# Profile the sequential baseline (pi_eval_seq, built without OpenMP) with time, gprof and
+# perf, plus repeated per-module timing. Results are written to profile_results/<variant>/.
 #
-#   bash tools/profile.sh [--faithful] [-n RUNS] [-c CORE] image1.png [image2.png ...]
+#   bash tools/profile.sh [--faithful] [--pirm] [-n RUNS] [-c CORE] [-o DIR] image1.png [image2.png ...]
 #
 #   --faithful  profile the faithful port instead of the optimized baseline (much slower;
 #               use few images and -n 1)
+#   --pirm      PIRM protocol for RGB inputs (Y channel, 4-pixel border removed)
+#   -o DIR      output directory (default profile_results); <variant>/ is created inside
 #   -n RUNS     repetitions of the per-module timing; the median is reported (default 5)
 #   -c CORE     CPU core to pin the program to with taskset (default 0)
 #
@@ -21,22 +23,28 @@ set -uo pipefail
 VARIANT=baseline
 RUNS=5
 CORE=0
+OUTDIR=""
+PIRM=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --faithful) VARIANT=faithful; shift ;;
     -n) RUNS=$2; shift 2 ;;
+    --pirm) PIRM=1; shift ;;
     -c) CORE=$2; shift 2 ;;
+    -o) OUTDIR=$2; shift 2 ;;
     -*) echo "unknown option $1" >&2; exit 1 ;;
     *) break ;;
   esac
 done
-[ $# -gt 0 ] || { echo "usage: $0 [--faithful] [-n RUNS] [-c CORE] images..." >&2; exit 1; }
+[ $# -gt 0 ] || { echo "usage: $0 [--faithful] [--pirm] [-n RUNS] [-c CORE] [-o DIR] images..." >&2; exit 1; }
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 IMAGES=()
 for f in "$@"; do IMAGES+=("$(cd "$(dirname "$f")" && pwd)/$(basename "$f")"); done
 FLAGS=(--models "$ROOT/models")
 [ "$VARIANT" = faithful ] && FLAGS+=(--faithful)
+[ "$PIRM" = 1 ] && FLAGS+=(--pirm)
+BIN="$ROOT/pi_eval_seq"
 
 PIN=()
 command -v taskset >/dev/null && PIN=(taskset -c "$CORE")
@@ -46,8 +54,9 @@ if ! "$PERF" --version >/dev/null 2>&1; then
   PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | tail -1)
 fi
 
-make -C "$ROOT" -s pi_eval pi_eval_gprof || exit 1
-OUT="$ROOT/profile_results/$VARIANT"
+make -C "$ROOT" -s pi_eval_seq pi_eval_gprof || exit 1
+if [ -n "$OUTDIR" ]; then mkdir -p "$OUTDIR" && OUTDIR=$(cd "$OUTDIR" && pwd); else OUTDIR="$ROOT/profile_results"; fi
+OUT="$OUTDIR/$VARIANT"
 mkdir -p "$OUT"
 cd "$OUT" || exit 1
 {
@@ -59,21 +68,21 @@ cd "$OUT" || exit 1
 } > summary.txt
 
 # warm-up run (not measured), so that the model file is in the page cache
-"${PIN[@]}" "$ROOT/pi_eval" "${FLAGS[@]}" "${IMAGES[0]}" > /dev/null
+"${PIN[@]}" "$BIN" "${FLAGS[@]}" "${IMAGES[0]}" > /dev/null
 
 echo "[1/5] time"
 if [ -x /usr/bin/time ]; then
   /usr/bin/time -f "elapsed %e s, user %U s, system %S s, max RSS %M KB" -o time.txt \
-    "${PIN[@]}" "$ROOT/pi_eval" "${FLAGS[@]}" "${IMAGES[@]}" > /dev/null
+    "${PIN[@]}" "$BIN" "${FLAGS[@]}" "${IMAGES[@]}" > /dev/null
 else
-  { TIMEFORMAT='elapsed %R s, user %U s, system %S s'; time "${PIN[@]}" "$ROOT/pi_eval" "${FLAGS[@]}" "${IMAGES[@]}" > /dev/null; } 2> time.txt
+  { TIMEFORMAT='elapsed %R s, user %U s, system %S s'; time "${PIN[@]}" "$BIN" "${FLAGS[@]}" "${IMAGES[@]}" > /dev/null; } 2> time.txt
 fi
 { echo; echo "== time"; cat time.txt; } >> summary.txt
 
 echo "[2/5] per-module timing, $RUNS run(s)"
 : > timing_runs.txt
 for i in $(seq 1 "$RUNS"); do
-  "${PIN[@]}" "$ROOT/pi_eval" "${FLAGS[@]}" --timing "${IMAGES[@]}" | grep '^Total time per module' >> timing_runs.txt
+  "${PIN[@]}" "$BIN" "${FLAGS[@]}" --timing "${IMAGES[@]}" | grep '^Total time per module' >> timing_runs.txt
 done
 python3 - timing_runs.txt >> summary.txt <<'EOF'
 import re, statistics, sys
@@ -99,7 +108,7 @@ gprof -b "$ROOT/pi_eval_gprof" gmon.out > gprof.txt 2>/dev/null
   sed -n '/^Flat profile/,/^$/p;/^ *%/,/^$/p' gprof.txt | sed -n '1,20p'; } >> summary.txt
 
 echo "[4/5] perf record"
-if [ -n "$PERF" ] && "$PERF" record -q -g -o perf.data -- "${PIN[@]}" "$ROOT/pi_eval" "${FLAGS[@]}" "${IMAGES[@]}" > /dev/null 2> perf_record.log; then
+if [ -n "$PERF" ] && "$PERF" record -q -g -o perf.data -- "${PIN[@]}" "$BIN" "${FLAGS[@]}" "${IMAGES[@]}" > /dev/null 2> perf_record.log; then
   "$PERF" report -i perf.data --stdio --no-children --sort symbol -g none 2>/dev/null \
     | grep -v '^$' | sed -E 's/[[:space:]-]+$//' > perf_report.txt
   { echo; echo "== perf record: hottest functions (top 15)"
@@ -111,7 +120,7 @@ fi
 echo "[5/5] perf stat"
 if [ -n "$PERF" ]; then
   "$PERF" stat -e cycles,instructions,cache-references,cache-misses,branch-misses -o perf_stat.txt \
-    -- "${PIN[@]}" "$ROOT/pi_eval" "${FLAGS[@]}" "${IMAGES[@]}" > /dev/null 2>&1
+    -- "${PIN[@]}" "$BIN" "${FLAGS[@]}" "${IMAGES[@]}" > /dev/null 2>&1
   { echo; echo "== perf stat (\"not supported\" means this machine exposes no hardware counters)"
     grep -E 'cycles|instructions|cache|branch|elapsed' perf_stat.txt; } >> summary.txt
 fi
