@@ -14,6 +14,9 @@ class GgdTable {
 public:
     GgdTable();
     double fit(const double* x, size_t n) const;           // returns the shape parameter
+    // Shape of the concatenation [x1, x2], summed in the same order as fit() on a copy of
+    // the concatenated vector, so the result is identical without building that vector.
+    double fit_pair(const double* x1, size_t n1, const double* x2, size_t n2) const;
     double fit_rho(double rho) const;                       // lookup only
     double fit_rho_bruteforce(double rho) const;            // reference implementation
     // As the official gama_gen_gauss: rebuild the table and scan it linearly on every call.

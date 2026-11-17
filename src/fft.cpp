@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "parallel.h"
+
 namespace mc {
 
 namespace {
@@ -91,23 +93,79 @@ private:
     }
 };
 
-// transform every column (dim 1) then every row (dim 2)
+// One 1-D transform of x[0..n). The inverse is conj(fft(conj(x))), without the 1/n scaling.
+// Every version (sequential, naive, designed) goes through this function, so a line gets
+// exactly the same arithmetic whichever thread runs it.
+inline void transform_line(const FftPlan& p, cplx* x, size_t n, bool inverse, cplx* work) {
+    if (inverse)
+        for (size_t i = 0; i < n; ++i) x[i] = std::conj(x[i]);
+    p.forward(x, work);
+    if (inverse)
+        for (size_t i = 0; i < n; ++i) x[i] = std::conj(x[i]);
+}
+
+// Rows transformed together by one chunk of the row pass (see rows_pass).
+constexpr long kRowTile = 8;
+
+// Column pass of the designed version: load(c, column) fills column c of o (it may do
+// nothing if o already holds the data), then the column is transformed in place.
+// Columns are independent of each other and contiguous in memory. Each chunk owns a
+// contiguous range of whole columns and its own workspace, allocated once per chunk; the
+// plan is only read. Uniform work, so a static block partition.
+template <class Load>
+void columns_pass(CMat& o, const FftPlan& plan, bool inverse, const Config& cfg, Load&& load) {
+    const size_t R = o.rows;
+    par_for(cfg, o.cols, Sched{}, [&](long lo, long hi) {
+        std::vector<cplx> work(plan.work_size());
+        for (long c = lo; c < hi; ++c) {
+            cplx* col = &o.d[static_cast<size_t>(c) * R];
+            load(c, col);
+            transform_line(plan, col, R, inverse, work.data());
+        }
+    });
+}
+
+// Row pass of the designed version: every row of o is transformed and handed to
+// store(r, c, value). Rows are independent of each other, but a row is strided in a
+// column-major matrix and neighbouring rows share cache lines. Each chunk therefore owns a
+// contiguous block of rows and walks it in tiles of kRowTile rows: a tile is gathered
+// column by column (kRowTile adjacent elements per column, a few sequential write streams)
+// into a row-major scratch, transformed there, and scattered the same way. Only the rows
+// at the border between two chunks share cache lines, and each element is written once.
+// The scratch and the workspace are allocated once per chunk.
+template <class Store>
+void rows_pass(const CMat& o, const FftPlan& plan, bool inverse, const Config& cfg, Store&& store) {
+    const size_t R = o.rows, C = o.cols;
+    par_for(cfg, o.rows, Sched{}, [&](long lo, long hi) {
+        std::vector<cplx> tile(static_cast<size_t>(kRowTile) * C), work(plan.work_size());
+        for (long r0 = lo; r0 < hi; r0 += kRowTile) {
+            const long nt = std::min(kRowTile, hi - r0);
+            for (size_t c = 0; c < C; ++c) {
+                const cplx* src = &o.d[c * R + r0];
+                for (long t = 0; t < nt; ++t) tile[t * C + c] = src[t];
+            }
+            for (long t = 0; t < nt; ++t) transform_line(plan, &tile[t * C], C, inverse, work.data());
+            for (size_t c = 0; c < C; ++c)
+                for (long t = 0; t < nt; ++t) store(static_cast<int>(r0 + t), static_cast<int>(c), tile[t * C + c]);
+        }
+    });
+}
+
+// Transform every column (dim 1) then every row (dim 2): sequential baseline, and the naive
+// version, which puts a `parallel for` on both loops with a private copy of the buffers
+// per thread.
 void fft2_inplace(CMat& o, bool inverse, const Config& cfg) {
     (void)cfg;
     const FftPlan pr(o.rows), pc(o.cols);
     std::vector<cplx> buf(std::max(o.rows, o.cols));
     std::vector<cplx> work(std::max(pr.work_size(), pc.work_size()));
-    auto run = [&](const FftPlan& p, cplx* x, size_t n) {
-        if (inverse)
-            for (size_t i = 0; i < n; ++i) x[i] = std::conj(x[i]);
-        p.forward(x, work.data());
-        if (inverse)
-            for (size_t i = 0; i < n; ++i) x[i] = std::conj(x[i]);
-    };
-    for (int c = 0; c < o.cols; ++c) run(pr, &o.d[static_cast<size_t>(c) * o.rows], o.rows);
+    #pragma omp parallel for num_threads(cfg.threads) if(cfg.naive()) firstprivate(work)
+    for (int c = 0; c < o.cols; ++c)
+        transform_line(pr, &o.d[static_cast<size_t>(c) * o.rows], o.rows, inverse, work.data());
+    #pragma omp parallel for num_threads(cfg.threads) if(cfg.naive()) firstprivate(buf, work)
     for (int r = 0; r < o.rows; ++r) {
         for (int c = 0; c < o.cols; ++c) buf[c] = o(r, c);
-        run(pc, buf.data(), o.cols);
+        transform_line(pc, buf.data(), o.cols, inverse, work.data());
         for (int c = 0; c < o.cols; ++c) o(r, c) = buf[c];
     }
 }
@@ -126,20 +184,80 @@ void fft_inplace(std::vector<cplx>& x, bool inverse) {
 
 CMat fft2(const Mat& a, const Config& cfg) {
     CMat o(a.rows, a.cols);
+    if (cfg.designed()) {
+        // the real-to-complex copy is done by the chunk that transforms the column
+        const FftPlan pr(a.rows), pc(a.cols);
+        columns_pass(o, pr, false, cfg, [&](long c, cplx* col) {
+            const double* src = &a.d[static_cast<size_t>(c) * a.rows];
+            for (int r = 0; r < a.rows; ++r) col[r] = src[r];
+        });
+        rows_pass(o, pc, false, cfg, [&](int r, int c, const cplx& v) { o(r, c) = v; });
+        return o;
+    }
     for (size_t i = 0; i < a.numel(); ++i) o.d[i] = a.d[i];
     fft2_inplace(o, false, cfg);
     return o;
 }
 
 CMat ifft2(const CMat& a, const Config& cfg) {
+    const double s = 1.0 / (static_cast<double>(a.rows) * a.cols);
+    if (cfg.designed()) {
+        // copy and scaling are folded into the two passes: no serial sweep over the matrix
+        CMat o(a.rows, a.cols);
+        const FftPlan pr(a.rows), pc(a.cols);
+        columns_pass(o, pr, true, cfg, [&](long c, cplx* col) {
+            const cplx* src = &a.d[static_cast<size_t>(c) * a.rows];
+            std::copy(src, src + a.rows, col);
+        });
+        rows_pass(o, pc, true, cfg, [&](int r, int c, cplx v) {
+            v *= s;
+            o(r, c) = v;
+        });
+        return o;
+    }
     CMat o = a;
     fft2_inplace(o, true, cfg);
-    const double s = 1.0 / (static_cast<double>(a.rows) * a.cols);
     for (cplx& v : o.d) v *= s;
     return o;
 }
 
+Mat ifft2_real(CMat a, const Config& cfg) {
+    const double s = 1.0 / (static_cast<double>(a.rows) * a.cols);
+    Mat o(a.rows, a.cols);
+    if (cfg.designed()) {
+        const FftPlan pr(a.rows), pc(a.cols);
+        columns_pass(a, pr, true, cfg, [](long, cplx*) {});
+        // chunks own disjoint blocks of rows of the output
+        rows_pass(a, pc, true, cfg, [&](int r, int c, cplx v) {
+            v *= s;
+            o(r, c) = v.real();
+        });
+        return o;
+    }
+    fft2_inplace(a, true, cfg);
+    for (size_t i = 0; i < a.numel(); ++i) {
+        a.d[i] *= s;
+        o.d[i] = a.d[i].real();
+    }
+    return o;
+}
+
 namespace {
+// o(r, c) = a((r + pr) mod rows, (c + pc) mod cols). Pure permutation: every output column
+// is written by exactly one chunk and the input is only read.
+CMat shift2(const CMat& a, int pr, int pc, const Config& cfg) {
+    CMat o(a.rows, a.cols);
+    par_for(cfg, a.cols, Sched{}, [&](long lo, long hi) {
+        for (long c = lo; c < hi; ++c) {
+            const cplx* src = &a.d[static_cast<size_t>((c + pc) % a.cols) * a.rows];
+            cplx* dst = &o.d[static_cast<size_t>(c) * a.rows];
+            std::copy(src + pr, src + a.rows, dst);
+            std::copy(src, src + pr, dst + (a.rows - pr));
+        }
+    });
+    return o;
+}
+
 CMat shift2(const CMat& a, int pr, int pc) {
     CMat o(a.rows, a.cols);
     for (int c = 0; c < a.cols; ++c)
@@ -150,5 +268,7 @@ CMat shift2(const CMat& a, int pr, int pc) {
 
 CMat fftshift(const CMat& a) { return shift2(a, (a.rows + 1) / 2, (a.cols + 1) / 2); }
 CMat ifftshift(const CMat& a) { return shift2(a, a.rows / 2, a.cols / 2); }
+CMat fftshift(const CMat& a, const Config& cfg) { return shift2(a, (a.rows + 1) / 2, (a.cols + 1) / 2, cfg); }
+CMat ifftshift(const CMat& a, const Config& cfg) { return shift2(a, a.rows / 2, a.cols / 2, cfg); }
 
 }  // namespace mc

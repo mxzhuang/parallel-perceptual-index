@@ -40,6 +40,29 @@ double ggd_rho(const double* x, size_t n) {
     mean_abs *= mean_abs;
     return v / (mean_abs + 0.0000001);
 }
+
+// ggd_rho of the concatenation [x1, x2]. Every sum runs over x1 and then x2 with one
+// accumulator, which is the order of mc::mean, mc::var and ggd_rho on the concatenation.
+double ggd_rho_pair(const double* x1, size_t n1, const double* x2, size_t n2) {
+    const double n = static_cast<double>(n1 + n2);
+    double s = 0;
+    for (size_t i = 0; i < n1; ++i) s += x1[i];
+    for (size_t i = 0; i < n2; ++i) s += x2[i];
+    const double mu = s / n;
+    double v = 0;
+    if (n1 + n2 >= 2) {
+        double sq = 0;
+        for (size_t i = 0; i < n1; ++i) sq += (x1[i] - mu) * (x1[i] - mu);
+        for (size_t i = 0; i < n2; ++i) sq += (x2[i] - mu) * (x2[i] - mu);
+        v = sq / static_cast<double>(n1 + n2 - 1);
+    }
+    double sa = 0;
+    for (size_t i = 0; i < n1; ++i) sa += std::fabs(x1[i] - mu);
+    for (size_t i = 0; i < n2; ++i) sa += std::fabs(x2[i] - mu);
+    double mean_abs = sa / n;
+    mean_abs *= mean_abs;
+    return v / (mean_abs + 0.0000001);
+}
 }  // namespace
 
 GgdTable::GgdTable() {
@@ -76,6 +99,10 @@ double GgdTable::fit_rho(double rho) const {
 }
 
 double GgdTable::fit(const double* x, size_t n) const { return fit_rho(ggd_rho(x, n)); }
+
+double GgdTable::fit_pair(const double* x1, size_t n1, const double* x2, size_t n2) const {
+    return fit_rho(ggd_rho_pair(x1, n1, x2, n2));
+}
 
 // gam = 0.2:0.001:10; r_gam = ((gamma(2./gam)).^2)./(gamma(1./gam).*gamma(3./gam))
 void AggdTable::build(Vec& gam, Vec& r) {
