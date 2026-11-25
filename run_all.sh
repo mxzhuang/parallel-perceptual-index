@@ -184,6 +184,10 @@ PY=""
 {
   if [ ! -x .venv/bin/python ]; then
     echo "creating .venv"; python3 -m venv .venv || { echo "python3 -m venv failed"; rm -rf .venv; }
+    # python3-venv is often missing on shared machines; uv can create the same environment
+    if [ ! -x .venv/bin/python ] && command -v uv >/dev/null 2>&1; then
+      echo "creating .venv with uv"; uv venv --seed .venv || { echo "uv venv failed"; rm -rf .venv; }
+    fi
   fi
   if [ -x .venv/bin/python ]; then
     have_pkgs .venv/bin/python || .venv/bin/python -m pip install --disable-pip-version-check -q $PKGS || echo "pip install into .venv failed"

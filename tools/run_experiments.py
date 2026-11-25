@@ -93,7 +93,51 @@ def cpu_topology():
     return logical, min(physical, logical)
 
 
-def thread_sweep(tmax, physical, quick):
+def core_classes():
+    """Physical cores of this process, fastest first, for machines that mix core types.
+
+    Returns a list of (max frequency in kHz, sorted CPU numbers of the core). The maximum
+    frequency comes from cpufreq; where it is unavailable every core gets 0 and the machine
+    counts as homogeneous. Hybrid processors (performance and efficiency cores) show up as
+    two frequency classes.
+    """
+    usable = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(os.cpu_count() or 1))
+    groups = {}
+    try:
+        out = subprocess.run(["lscpu", "-p=CPU,CORE,SOCKET"], capture_output=True, text=True, timeout=20).stdout
+        for line in out.splitlines():
+            if line.startswith("#") or not line.strip():
+                continue
+            cpu, core, socket = line.split(",")[:3]
+            if int(cpu) in usable:
+                groups.setdefault((socket, core), []).append(int(cpu))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        groups = {}
+    if not groups:
+        groups = {("0", str(c)): [c] for c in usable}
+
+    def max_khz(cpu):
+        try:
+            with open(f"/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq") as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return 0
+
+    cores = [(max(max_khz(c) for c in cpus), sorted(cpus)) for cpus in groups.values()]
+    return sorted(cores, key=lambda fc: (-fc[0], fc[1][0]))
+
+
+def is_hybrid(cores):
+    """True if the slowest core's maximum frequency is over 5% below the fastest one's."""
+    freqs = [f for f, _ in cores if f > 0]
+    return len(freqs) == len(cores) and bool(freqs) and min(freqs) < 0.95 * max(freqs)
+
+
+def fast_core_count(cores):
+    return sum(1 for f, _ in cores if f >= 0.95 * cores[0][0]) if cores else 0
+
+
+def thread_sweep(tmax, physical, quick, fast_cores=0):
     counts, t = set(), 1
     while t <= tmax:
         counts.add(t)
@@ -101,6 +145,8 @@ def thread_sweep(tmax, physical, quick):
     counts.add(tmax)
     if physical < tmax:  # hyper-threading: also measure one thread per physical core
         counts.add(physical)
+    if 0 < fast_cores < tmax:  # hybrid processor: also measure the fast cores alone
+        counts.add(fast_cores)
     counts = sorted(counts)
     if quick and len(counts) > 3:
         counts = [counts[0], counts[len(counts) // 2], counts[-1]]
@@ -108,10 +154,18 @@ def thread_sweep(tmax, physical, quick):
 
 
 class Runner:
-    def __init__(self, a, tmax, physical):
+    def __init__(self, a, tmax, physical, cores=()):
         self.a = a
         self.tmax = tmax
         self.physical = physical
+        self.cores = list(cores)
+        self.hybrid = is_hybrid(self.cores)
+        # On a hybrid processor the places are listed explicitly, fastest cores first, so
+        # that T threads with close binding always use the T fastest cores.
+        self.places = "cores"
+        if self.hybrid:
+            self.places = ",".join("{" + ",".join(str(c) for c in cpus) + "}" for _, cpus in self.cores)
+        self.taskset = None if a.no_pin else shutil.which("taskset")
         self.raw = os.path.join(a.results, "raw")
         self.ran = self.reused = self.failed = 0
         self.failures = []
@@ -122,13 +176,20 @@ class Runner:
             env.pop(k, None)
         omp = {}
         if not self.a.no_pin:
-            omp = {"OMP_PROC_BIND": bind, "OMP_PLACES": "cores"}
+            omp = {"OMP_PROC_BIND": bind, "OMP_PLACES": self.places}
         omp["OMP_DYNAMIC"] = "false"
         env.update(omp)
         return env, omp
 
-    def run(self, exp, name, binary, args, images, labels, bind="close", warmup=True, timeout=None, extra_files=()):
-        """Run one configuration; returns True if its report is available."""
+    def run(self, exp, name, binary, args, images, labels, bind="close", warmup=True, timeout=None, extra_files=(),
+            cpu=None):
+        """Run one configuration; returns True if its report is available.
+
+        The binary built without OpenMP ignores OMP_PLACES, so it is pinned with taskset: to
+        `cpu` if given, else to the first CPU of the fastest core. An unpinned sequential run
+        can migrate between cores, and on a hybrid processor between core types, which would
+        make the denominator of every speedup unstable.
+        """
         out = os.path.join(self.raw, exp)
         os.makedirs(out, exist_ok=True)
         report = os.path.join(out, name + ".report")
@@ -146,6 +207,10 @@ class Runner:
             cmd.append("--warmup")
         cmd += images
         env, omp = self.env(bind)
+        pinned_cpu = None
+        if binary == "pi_eval_seq" and self.taskset and self.cores:
+            pinned_cpu = self.cores[0][1][0] if cpu is None else cpu
+            cmd = [self.taskset, "-c", str(pinned_cpu), *cmd]
         t0 = time.time()
         with open(os.path.join(out, name + ".log"), "w") as lf:
             lf.write("$ " + " ".join(shlex.quote(c) for c in cmd) + "\n")
@@ -161,6 +226,7 @@ class Runner:
                 lf.write(f"\ncould not start: {e}\n")
         elapsed = time.time() - t0
         meta = {"experiment": exp, "name": name, "binary": binary, "command": cmd, "omp_env": omp,
+                "pinned_cpu": pinned_cpu,
                 "warmup": warmup, "returncode": rc, "elapsed_seconds": round(elapsed, 3),
                 "date": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "files": [os.path.basename(f) for f in extra_files]}
         meta.update(labels)
@@ -230,6 +296,11 @@ def e1(r, inputs, reps):
     inp = inputs[0]
     r.run("E1", f"{inp['id']}_seq", "pi_eval_seq", ["--mode", "seq"], [inp["path"]] * reps,
           base_labels(inp, "seq", 1, variant="baseline"))
+    if r.hybrid and r.taskset:
+        # the same baseline on one of the slowest cores: the ratio of the two times is the
+        # relative speed of the core types, needed to judge scaling beyond the fast cores
+        r.run("E1", f"{inp['id']}_seq_slow_core", "pi_eval_seq", ["--mode", "seq"], [inp["path"]] * reps,
+              base_labels(inp, "seq", 1, variant="baseline_slow_core"), cpu=r.cores[-1][1][0])
     if r.a.skip_faithful:
         log("  E1 faithful variant skipped (--skip-faithful)")
         return
@@ -471,18 +542,26 @@ def main():
     logical, physical = cpu_topology()
     tmax = min(logical, a.threads_max) if a.threads_max > 0 else logical
     physical = min(physical, tmax)
-    sweep = thread_sweep(tmax, physical, a.quick)
+    cores = core_classes()
+    hybrid = is_hybrid(cores)
+    sweep = thread_sweep(tmax, physical, a.quick, fast_core_count(cores) if hybrid else 0)
     inputs = load_inputs(a)
     sets = image_sets(a)
-    r = Runner(a, tmax, physical)
+    r = Runner(a, tmax, physical, cores)
     os.makedirs(r.raw, exist_ok=True)
     plan = {"experiments": selected, "quick": a.quick, "repetitions": reps, "e6_repetitions": e6_reps,
             "threads_max": tmax, "logical_cpus": logical, "physical_cores": physical, "thread_sweep": sweep,
-            "pinning": None if a.no_pin else {"single image": "OMP_PROC_BIND=close OMP_PLACES=cores",
-                                              "image sets (E6, E7)": "OMP_PROC_BIND=spread,close OMP_PLACES=cores"},
+            "pinning": None if a.no_pin else {"single image": f"OMP_PROC_BIND=close OMP_PLACES={r.places}",
+                                              "image sets (E6, E7)": f"OMP_PROC_BIND=spread,close OMP_PLACES={r.places}",
+                                              "sequential binary": f"taskset -c {cores[0][1][0]}" if r.taskset and cores else None},
+            "hybrid": hybrid,
+            "cores": [{"max_khz": f, "cpus": cpus} for f, cpus in cores],
             "inputs": inputs, "image_sets": {f"{s}/{m}": len(v) for (s, m), v in sorted(sets.items())}}
     with open(os.path.join(a.results, "experiment_plan.json"), "w") as f:
         json.dump(plan, f, indent=1)
+    if hybrid:
+        log(f"Hybrid processor: {fast_core_count(cores)} fast and {len(cores) - fast_core_count(cores)} slow core(s); "
+            "threads are placed on the fastest cores first")
     log(f"Experiments {', '.join(selected)}: threads {sweep} (max {tmax}, {physical} physical core(s)), "
         f"{reps} repetition(s), inputs {', '.join(i['id'] for i in inputs)}")
     estimate(r, inputs, reps, e6_reps, sweep, tmax, sets, selected)

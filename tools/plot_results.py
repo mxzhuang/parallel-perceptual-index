@@ -271,7 +271,8 @@ def plot_cost(data, out):
                     ax.text(left + share / 2, vi, f"{share:.0f}", ha="center", va="center", fontsize=6, color="white")
                 left += share
                 cells.append((r[0]["median"], share))
-            name = "optimized baseline" if variant == "baseline" else "faithful port"
+            name = {"baseline": "optimized baseline", "faithful": "faithful port",
+                    "baseline_slow_core": "baseline on a slow core"}.get(variant, variant)
             rows_tex.append((name, wall[0]["median"] if wall else float("nan"), cells))
         ax.set_yticks(range(len(variants)))
         ax.set_yticklabels(["baseline" if v == "baseline" else v for v in variants])

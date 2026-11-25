@@ -95,6 +95,9 @@ def common(machine, exp, run, input_name=None):
     cfg = run["report"]["config"]
     for k in CONFIG_KEYS:
         row[k] = cfg.get(k, "")
+    # the run's own label is more specific than the program's (e.g. baseline_slow_core)
+    if run.get("variant"):
+        row["variant"] = run["variant"]
     return row
 
 

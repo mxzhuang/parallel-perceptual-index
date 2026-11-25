@@ -97,8 +97,17 @@ slightly from numbers published for MATLAB-generated bicubic images.
 - Speedup is the median wall time of the sequential baseline (`pi_eval_seq`, built without
   OpenMP) on the same input and machine, divided by the median wall time of the configuration.
   Efficiency is speedup divided by the thread count.
+- The sequential binary does not read the OpenMP environment, so it is pinned with `taskset`
+  to one CPU of the fastest core. Unpinned, it could migrate during a run.
 - Thread counts: powers of two up to the number of usable CPUs, that number itself, and the
   number of physical cores when hyper-threading is detected.
+- Hybrid processors (performance and efficiency cores, detected from the maximum frequency
+  that cpufreq reports per core) get three adjustments. The places are listed explicitly with
+  the fastest cores first, so T threads always run on the T fastest cores. The number of fast
+  cores is added to the thread counts. E1 also times the baseline on one of the slowest cores
+  (variant `baseline_slow_core`). On such a machine the speedup at full thread count cannot
+  reach the thread count: with f fast cores, s slow cores and a slow core taking r times as
+  long as a fast one for the baseline, the capacity is f + s / r fast-core equivalents.
 
 ## Experiments
 
