@@ -105,7 +105,9 @@ slightly from numbers published for MATLAB-generated bicubic images.
   that cpufreq reports per core) get three adjustments. The places are listed explicitly with
   the fastest cores first, so T threads always run on the T fastest cores. The number of fast
   cores is added to the thread counts. E1 also times the baseline on one of the slowest cores
-  (variant `baseline_slow_core`). On such a machine the speedup at full thread count cannot
+  (variant `baseline_slow_core`). The ablations (E3) and the load-balance runs (E4) use the
+  fast cores alone as their second thread count, so that one set of runs is free of the
+  imbalance that unequal cores cause by themselves. On such a machine the speedup at full thread count cannot
   reach the thread count: with f fast cores, s slow cores and a slow core taking r times as
   long as a fast one for the baseline, the capacity is f + s / r fast-core equivalents.
 

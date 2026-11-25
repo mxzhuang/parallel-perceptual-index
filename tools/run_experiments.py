@@ -319,10 +319,19 @@ def e2(r, inputs, reps, sweep):
                       [inp["path"]] * reps, base_labels(inp, mode, t))
 
 
+def second_thread_count(r, tmax):
+    """The smaller thread count of E3 and E4: half the maximum, or, on a hybrid processor,
+    the number of fast cores, so that one set of runs uses identical cores only."""
+    if r.hybrid:
+        fast = fast_core_count(r.cores)
+        return fast if 2 <= fast < tmax else 0
+    return tmax // 2 if tmax // 2 >= 2 else 0
+
+
 def e3(r, inputs, reps, tmax):
     inp = inputs[0]
-    half = tmax // 2
-    for t in [tmax] + ([half] if half >= 2 else []):
+    second = second_thread_count(r, tmax)
+    for t in [tmax] + ([second] if second else []):
         for mode in ("intra", "graph"):
             common = ["--mode", mode, "--threads", str(t)]
             r.run("E3", f"{inp['id']}_{mode}_t{t}_default", "pi_eval", common, [inp["path"]] * reps,
@@ -339,11 +348,15 @@ def e3(r, inputs, reps, tmax):
 def e4(r, inputs, reps, tmax):
     # no warm-up: --balance accumulates over everything the process evaluates
     inp = inputs[0]
-    for group, opt, values in BALANCE:
-        for v in values:
-            r.run("E4", f"{inp['id']}_intra_t{tmax}_{group}-{tag(v)}", "pi_eval",
-                  ["--mode", "intra", "--threads", str(tmax), "--balance", opt, v], [inp["path"]] * reps,
-                  base_labels(inp, "intra", tmax, group=group, value=v, is_default=v == values[0]), warmup=False)
+    # on a hybrid processor also at the fast cores alone: unequal cores unbalance a static
+    # schedule by themselves, and the two thread counts separate that from the schedule
+    counts = [tmax] + ([second_thread_count(r, tmax)] if r.hybrid and second_thread_count(r, tmax) else [])
+    for t in counts:
+        for group, opt, values in BALANCE:
+            for v in values:
+                r.run("E4", f"{inp['id']}_intra_t{t}_{group}-{tag(v)}", "pi_eval",
+                      ["--mode", "intra", "--threads", str(t), "--balance", opt, v], [inp["path"]] * reps,
+                      base_labels(inp, "intra", t, group=group, value=v, is_default=v == values[0]), warmup=False)
 
 
 def e5(r, inputs, tmax):

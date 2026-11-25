@@ -10,7 +10,7 @@ with the dump of the sequential baseline (pi_eval_seq):
   * the designed versions (intra, graph) must produce bit-identical dumps for every thread
     count, schedule and design switch, because their reductions use a fixed chunk grid.
 
-Usage: check_parallel.py [--bin ./pi_eval] [--seq ./pi_eval_seq] [--threads 1,2,4]
+Usage: check_parallel.py [--bin ./pi_eval] [--seq ./pi_eval_seq] [--threads 1,2,4,N]
                          [--quick] [images ...]
 Exit status 0 if every configuration passes.
 """
@@ -97,13 +97,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", default="./pi_eval")
     ap.add_argument("--seq", default="./pi_eval_seq")
-    ap.add_argument("--threads", default="1,2,4")
+    ap.add_argument("--threads", default=None, help="thread counts to test (default: 1, 2, 4 and all CPUs)")
     ap.add_argument("--quick", action="store_true", help="modes and thread counts only, no design switches")
     ap.add_argument("--pirm", action="store_true", help="pass --pirm (for RGB inputs)")
     ap.add_argument("images", nargs="*")
     a = ap.parse_args()
     images = a.images or sorted(glob.glob("tests/images/*_y.png"))
-    threads = [int(t) for t in a.threads.split(",")]
+    if a.threads:
+        threads = [int(t) for t in a.threads.split(",")]
+    else:
+        cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+        threads = sorted({1, 2, 4, cpus})
     extra = ["--pirm"] if a.pirm else []
     os.makedirs("tests/out", exist_ok=True)
 
